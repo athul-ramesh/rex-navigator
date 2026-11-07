@@ -1,6 +1,3 @@
--- Rex session picker: one floating fzf over zoxide paths; Enter creates a session
--- and switches this Rex app client to it. Heavy work lives in rex-sesh-picker.
-
 local M = {}
 
 local home = os.getenv("HOME") or ""
@@ -113,7 +110,7 @@ rex.action{
     if ctx.session_id == nil then
       error("run from a terminal pane (key or palette), not bare rex CLI", 0)
     end
-    -- Config actions are killed at ~30s; detached children die with them. Return once the float is up.
+    -- Config actions are killed at ~30s; detached children die with them.
     return M.open(ctx)
   end,
 }

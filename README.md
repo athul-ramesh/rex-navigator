@@ -13,9 +13,9 @@ Keyboard-driven **new Rex session from zoxide history**. A shortcut opens a floa
 
 ```bash
 mkdir -p ~/.config/rex
-cp lua/rex_sesh.lua ~/.config/rex/
-cp bin/rex-sesh-picker ~/.config/rex/
-chmod +x ~/.config/rex/rex-sesh-picker
+ln -sf "$(pwd)/lua/rex_sesh.lua" ~/.config/rex/rex_sesh.lua
+ln -sf "$(pwd)/bin/rex-sesh-picker" ~/.config/rex/rex-sesh-picker
+chmod +x bin/rex-sesh-picker
 ```
 
 Optional helper path override:
@@ -31,21 +31,31 @@ require("rex_sesh")
 rex.bind("cmd+shift+j", "rex_sesh")
 ```
 
-Reload Rex config after editing (`rex config reload` or restart the app).
+Then reload:
+
+```bash
+rex config reload
+```
 
 ## Usage
 
-Focus a terminal pane, press **⌘⇧J** (or run **New Session from Zoxide…** from the command palette). Esc cancels without creating a session.
+Focus a terminal pane and press ⌘⇧J, or run **New Session from Zoxide…** from the command palette. Esc cancels without creating a session.
+
+You can also run the installed action from a session:
+
+```bash
+rex -C "Mac mini" do -s "$REX_SESSION" rex_sesh
+```
 
 ## Remote Control
 
-Switching the Rex app UI uses `client.perform` `session.select`. If Rex refuses with a **Remote Control** message, the session may already exist. Enable **Settings → Rex Server → Remote Control**, or open the new session from the sidebar. The picker prints the `session_id` when switch fails after create.
+The helper switches the app with `client.perform` `session.select`. If Rex refuses because Remote Control is off, the session may already exist. Enable **Settings → Rex Server → Remote Control**, or open the new session from the sidebar. The picker prints the `session_id` when switch fails after create.
 
 ## Development
 
 ```bash
 python3 -m py_compile bin/rex-sesh-picker
-rex do /path/to/rex-navigator/lua/rex_sesh.lua --action rex_sesh
+python3 bin/rex-sesh-picker --help
 ```
 
-The `rex_sesh` action must run from a live pane (not bare CLI without session context).
+Do not load `lua/rex_sesh.lua` with `rex do … --action`. That path tries to encode the module table as JSON. Use `require("rex_sesh")` in `init.lua`, then `rex do rex_sesh` from a live session.
