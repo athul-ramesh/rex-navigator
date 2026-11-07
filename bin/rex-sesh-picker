@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Rex zoxide session picker: fzf over zoxide paths, rex new, client.perform session.select."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NoReturn
+
+PATH_FALLBACKS = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    str(
+        Path.home()
+        / "Library/Application Support/com.superlogical.rex"
+        / "RexServer/Versions/Current/Rex Server.app/Contents/MacOS"
+    ),
+]
+
+
+def find_bin(name: str) -> str | None:
+    paths = os.environ.get("PATH", "")
+    for prefix in PATH_FALLBACKS:
+        if prefix not in paths.split(os.pathsep):
+            paths = paths + os.pathsep + prefix
+    return shutil.which(name, path=paths)
+
+
+def run(argv: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True, **kw)
+
+
+def fail(msg: str, advice: str = "") -> NoReturn:
+    print(msg)
+    if advice:
+        print(advice)
+    print("\nPress Enter to close… ", flush=True)
+    try:
+        sys.stdin.readline()
+    except Exception:
+        pass
+    sys.exit(0)
+
+
+@dataclass(frozen=True)
+class CanonicalPath:
+    value: str
+
+    @staticmethod
+    def from_user_path(raw: str) -> CanonicalPath:
+        path = os.path.realpath(raw)
+        if not os.path.isdir(path):
+            raise ValueError(f"not a directory: {path}")
+        return CanonicalPath(path)
+
+
+@dataclass(frozen=True)
+class SessionLabel:
+    value: str
+
+
+@dataclass(frozen=True)
+class ZoxideCandidate:
+    path: CanonicalPath
+    label: SessionLabel
+    display: str
+
+
+@dataclass(frozen=True)
+class InvokeContext:
+    session_id: str
+    block_id: str
+    client_id: str
+
+
+@dataclass(frozen=True)
+class SessionRef:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class AppClientId:
+    value: str
+
+
+def zoxide_dirs(zox: str) -> list[CanonicalPath]:
+    r = run([zox, "query", "--list"])
+    if r.returncode != 0:
+        raise RuntimeError(f"zoxide query failed: {r.stderr.strip()}")
+    seen: set[str] = set()
+    out: list[CanonicalPath] = []
+    for line in r.stdout.splitlines():
+        raw = line.strip()
+        if not raw or not os.path.isdir(raw):
+            continue
+        canon = os.path.realpath(raw)
+        if canon in seen:
+            continue
+        seen.add(canon)
+        out.append(CanonicalPath(canon))
+    return out
+
+
+def list_session_labels(rex: str) -> set[str]:
+    r = run([rex, "ls", "--json"])
+    if r.returncode != 0:
+        raise RuntimeError(f"rex ls failed: {r.stderr.strip() or r.stdout.strip()}")
+    sessions = json.loads(r.stdout).get("sessions") or []
+    return {s.get("label", "") for s in sessions if s.get("label")}
+
+
+def session_label_for(path: CanonicalPath, live_labels: set[str]) -> SessionLabel:
+    base = os.path.basename(path.value.rstrip("/")) or path.value
+    if base in live_labels:
+        digest = hashlib.sha256(path.value.encode()).hexdigest()[:6]
+        base = f"{base}-{digest}"
+    return SessionLabel(base)
+
+
+def pretty(path: str) -> str:
+    home = str(Path.home())
+    if path == home or path.startswith(home + "/"):
+        return "~" + path[len(home) :]
+    return path
+
+
+def build_zoxide_candidates(
+    paths: list[CanonicalPath], live_labels: set[str]
+) -> list[ZoxideCandidate]:
+    out: list[ZoxideCandidate] = []
+    for p in paths:
+        label = session_label_for(p, live_labels)
+        disp = f"{label.value}   {pretty(p.value)}"
+        out.append(ZoxideCandidate(path=p, label=label, display=disp))
+    return out
+
+
+def render_fzf_input(
+    cands: list[ZoxideCandidate], token: str
+) -> tuple[str, dict[str, ZoxideCandidate]]:
+    lookup: dict[str, ZoxideCandidate] = {}
+    lines: list[str] = []
+    for i, c in enumerate(cands):
+        cid = f"{token}{i}"
+        lookup[cid] = c
+        line = f"{cid}\t{c.display}\t\x1b[2m{c.path.value}\x1b[0m"
+        lines.append(line)
+    return "\n".join(lines) + "\n", lookup
+
+
+def run_fzf(fzf: str, listing: str, lookup: dict[str, ZoxideCandidate]) -> ZoxideCandidate | None:
+    argv = [
+        fzf,
+        "--ansi",
+        "--delimiter=\t",
+        "--with-nth=2,3",
+        "--layout=reverse",
+        "--border=rounded",
+        "--margin=1,2",
+        "--prompt=zoxide ❯ ",
+        "--header=enter: new session · esc: cancel",
+    ]
+    proc = subprocess.run(
+        argv, input=listing.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    cid = proc.stdout.decode("utf-8", "replace").strip().split("\t", 1)[0].strip()
+    return lookup.get(cid)
+
+
+def create_session(rex: str, label: SessionLabel, path: CanonicalPath) -> SessionRef:
+    r = run([rex, "new", label.value, "--cwd", path.value, "--json"])
+    if r.returncode != 0:
+        raise RuntimeError(f"rex new failed: {r.stderr.strip() or r.stdout.strip()}")
+    sid = json.loads(r.stdout).get("session_id")
+    if not sid:
+        raise RuntimeError("rex new returned no session_id")
+    return SessionRef(sid)
+
+
+def resolve_app_client(rex: str, wanted: str) -> AppClientId:
+    r = run([rex, "api", "call", "client.list"])
+    if r.returncode != 0:
+        raise RuntimeError(f"client list failed: {r.stderr.strip()}")
+    clients = json.loads(r.stdout).get("clients", [])
+    apps = [
+        c
+        for c in clients
+        if c.get("info", {}).get("kind") == "app"
+        and c.get("connection_state", "connected") == "connected"
+    ]
+    for c in clients:
+        if c["client_id"] == wanted:
+            if (
+                c.get("info", {}).get("kind") == "app"
+                and c.get("connection_state", "connected") == "connected"
+            ):
+                return AppClientId(wanted)
+            break
+    if len(apps) == 1:
+        return AppClientId(apps[0]["client_id"])
+    if wanted:
+        raise RuntimeError(f"client {wanted} is not a connected Rex app")
+    raise RuntimeError(
+        "no client given and the connected Rex apps are not exactly one; "
+        "the action should pass --client"
+    )
+
+
+def perform_session_select(
+    rex: str, client: AppClientId, session: SessionRef, created_id: str
+) -> None:
+    payload = json.dumps(
+        {
+            "client_id": client.value,
+            "action": "session.select",
+            "args": {"session_id": session.session_id},
+            "origin": "script",
+        }
+    )
+    r = run([rex, "api", "call", "client.perform", "-"], input=payload)
+    if r.returncode == 0:
+        return
+    err = (r.stderr + r.stdout).strip()
+    if "Remote Control" in err:
+        advice = (
+            "Enable Remote Control in the Rex app: Settings → Rex Server. "
+            f"The session {created_id} was created; open it from the sidebar."
+        )
+        fail(f"Rex refused the switch: {err}", advice)
+    fail(f"switching the client failed: {err}")
+
+
+def parse_args(argv: list[str]) -> InvokeContext:
+    ap = argparse.ArgumentParser(description="Rex zoxide session picker helper.")
+    ap.add_argument("--session", default="")
+    ap.add_argument("--block", default="")
+    ap.add_argument("--client", default="")
+    args = ap.parse_args(argv)
+    return InvokeContext(
+        session_id=args.session,
+        block_id=args.block,
+        client_id=args.client,
+    )
+
+
+def main() -> None:
+    ctx = parse_args(sys.argv[1:])
+
+    missing = [n for n in ("rex", "fzf", "zoxide") if find_bin(n) is None]
+    if missing:
+        fail(
+            f"missing required programs: {', '.join(missing)}",
+            "Install them (brew install fzf zoxide) and make sure `rex` is on PATH.",
+        )
+
+    rex, fzf, zox = (find_bin(n) for n in ("rex", "fzf", "zoxide"))
+    assert rex and fzf and zox
+
+    try:
+        live_labels = list_session_labels(rex)
+    except RuntimeError as e:
+        fail(str(e), "Is the Rex server running? Run `rex ls` in a terminal to check.")
+
+    try:
+        paths = zoxide_dirs(zox)
+    except RuntimeError as e:
+        fail(str(e))
+
+    if not paths:
+        fail("no zoxide directories yet", "Visit some folders so zoxide has history.")
+
+    cands = build_zoxide_candidates(paths, live_labels)
+    token = hashlib.sha256(f"{time.time_ns()}".encode()).hexdigest()[:8]
+    listing, lookup = render_fzf_input(cands, token)
+    cand = run_fzf(fzf, listing, lookup)
+    if cand is None:
+        return
+
+    try:
+        path = CanonicalPath.from_user_path(cand.path.value)
+    except ValueError as e:
+        fail(str(e))
+        return
+
+    label = session_label_for(path, live_labels)
+    try:
+        session = create_session(rex, label, path)
+    except RuntimeError as e:
+        fail(f"creating session failed: {e}")
+        return
+
+    try:
+        client = resolve_app_client(rex, ctx.client_id)
+    except RuntimeError as e:
+        fail(
+            str(e),
+            f"The session {session.session_id} was created; open it from the sidebar.",
+        )
+        return
+
+    perform_session_select(rex, client, session, session.session_id)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        fail(f"picker error: {e}")
