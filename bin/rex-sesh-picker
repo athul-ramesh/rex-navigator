@@ -337,7 +337,7 @@ class PickerBoard:
         tty = TtySize.read()
         token = hashlib.sha256(f"{time.time_ns()}".encode()).hexdigest()[:8]
         listing = self._render_source(token, tty)
-        argv = self._fzf_argv(fzf, token)
+        argv = self._fzf_argv(fzf)
         proc = subprocess.run(
             argv,
             input=listing.encode("utf-8"),
@@ -398,7 +398,7 @@ class PickerBoard:
             return "enter: switch session · esc: cancel"
         return "enter: new session · esc: cancel"
 
-    def _fzf_argv(self, fzf_bin: str, token: str) -> list[str]:
+    def _fzf_argv(self, fzf_bin: str) -> list[str]:
         argv = [fzf_bin, *_SESH_FZF_FRAME.argv_tail(self._header())]
         if self.open_sessions and self.launches:
             argv.append("--no-sort")
@@ -531,7 +531,7 @@ def _board_source_self_check() -> None:
     assert isinstance(launched, Decision)
     assert isinstance(launched.choice, DirectoryLaunch)
     assert board._decision_from_stdout(token, f"{token}o99\tjunk") is None
-    argv = board._fzf_argv("fzf", token)
+    argv = board._fzf_argv("fzf")
     assert "--layout=reverse" in argv
     assert "--no-sort" in argv
     print("board source self-check ok")
@@ -553,7 +553,7 @@ def _fzf_pty_layout_check(fzf: str) -> None:
     assert row.endswith(marker), row
     listing = f"t0\t{row}\n"
     board = PickerBoard.build(LiveSessions(()), [])
-    argv = board._fzf_argv(fzf, "t0")
+    argv = board._fzf_argv(fzf)
 
     master, slave = pty.openpty()
     _pty_set_cols(master, 80)
