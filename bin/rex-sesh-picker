@@ -12,9 +12,10 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import AbstractSet, NoReturn
 
@@ -330,10 +331,13 @@ class PickerBoard:
         return not self.open_sessions and not self.launches
 
     def choose(self, fzf: str, rex: str, ctx: InvokeContext) -> None:
-        decision = self._pick(fzf)
+        history = VisitHistory.default()
+        board = replace(self, open_sessions=history.order(ctx, self.open_sessions))
+        decision = board._pick(fzf)
         if decision is None:
             return
-        apply_decision(rex, ctx, decision)
+        arrived = apply_decision(rex, ctx, decision)
+        history.remember(ctx, arrived)
 
     def _pick(self, fzf: str) -> Decision | None:
         tty = TtySize.read()
@@ -440,7 +444,7 @@ def pretty(path: str) -> str:
     return path
 
 
-def apply_decision(rex: str, ctx: InvokeContext, decision: Decision) -> None:
+def apply_decision(rex: str, ctx: InvokeContext, decision: Decision) -> SessionRef:
     choice = decision.choice
     if isinstance(choice, OpenSession):
         try:
@@ -451,7 +455,7 @@ def apply_decision(rex: str, ctx: InvokeContext, decision: Decision) -> None:
                 "That session is still open. Pick it from the sidebar.",
             ) from e
         perform_session_select(rex, client, choice.ref, created=None)
-        return
+        return choice.ref
 
     if isinstance(choice, DirectoryLaunch):
         try:
@@ -470,9 +474,128 @@ def apply_decision(rex: str, ctx: InvokeContext, decision: Decision) -> None:
                 f"The session {session.session_id} was created; open it from the sidebar.",
             ) from e
         perform_session_select(rex, client, session, created=session)
-        return
+        return session
 
     raise ActionError(f"unknown picker choice: {type(choice).__name__}")
+
+
+@dataclass(frozen=True)
+class _VisitEdge:
+    departed: SessionRef
+    arrived: SessionRef
+
+    @staticmethod
+    def make(departed: SessionRef, arrived: SessionRef) -> _VisitEdge | None:
+        if not departed.session_id or not arrived.session_id:
+            return None
+        if departed == arrived:
+            return None
+        return _VisitEdge(departed, arrived)
+
+    def back_target(self, here: SessionRef) -> _BackTarget | None:
+        if self.arrived != here:
+            return None
+        return _BackTarget(self.departed)
+
+
+@dataclass(frozen=True)
+class _BackTarget:
+    ref: SessionRef
+
+
+class VisitHistory:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    @staticmethod
+    def default() -> VisitHistory:
+        return VisitHistory(
+            Path.home() / ".config" / "rex" / "rex-sesh-visit-edge.json"
+        )
+
+    def order(
+        self, ctx: InvokeContext, sessions: tuple[OpenSession, ...]
+    ) -> tuple[OpenSession, ...]:
+        here = _here(ctx)
+        if here is None:
+            return sessions
+        edge = self._load()
+        if edge is None:
+            return sessions
+        return _lift_back_target(sessions, edge.back_target(here))
+
+    def remember(self, ctx: InvokeContext, arrived: SessionRef) -> None:
+        departed = _here(ctx)
+        if departed is None:
+            return
+        edge = _VisitEdge.make(departed, arrived)
+        if edge is None:
+            return
+        if self._load() == edge:
+            return
+        try:
+            self._store(edge)
+        except OSError as e:
+            print(f"rex-sesh-picker: could not save visit edge: {e}", file=sys.stderr)
+
+    def _load(self) -> _VisitEdge | None:
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or data.get("v") != 1:
+            return None
+        departed = data.get("departed")
+        arrived = data.get("arrived")
+        if not isinstance(departed, str) or not departed:
+            return None
+        if not isinstance(arrived, str) or not arrived:
+            return None
+        return _VisitEdge.make(SessionRef(departed), SessionRef(arrived))
+
+    def _store(self, edge: _VisitEdge) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "v": 1,
+            "departed": edge.departed.session_id,
+            "arrived": edge.arrived.session_id,
+        }
+        tmp = self._path.with_name(self._path.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        os.replace(tmp, self._path)
+
+
+def _here(ctx: InvokeContext) -> SessionRef | None:
+    if ctx.session_id == "":
+        return None
+    return SessionRef(ctx.session_id)
+
+
+def _lift_back_target(
+    sessions: tuple[OpenSession, ...], target: _BackTarget | None
+) -> tuple[OpenSession, ...]:
+    if target is None:
+        return sessions
+    for i, session in enumerate(sessions):
+        if session.ref == target.ref:
+            if i == 0:
+                return sessions
+            return (session,) + sessions[:i] + sessions[i + 1 :]
+    return sessions
+
+
+def _open_sessions_by_ids(
+    ids: tuple[str, ...],
+) -> tuple[OpenSession, ...]:
+    return tuple(
+        OpenSession(SessionRef(sid), SessionLabel(sid)) for sid in ids
+    )
 
 
 def _layout_row_self_check() -> None:
@@ -540,6 +663,97 @@ def _board_source_self_check() -> None:
     assert "--layout=reverse" in argv
     assert "--no-sort" in argv
     print("board source self-check ok")
+
+
+def _visit_history_self_check() -> None:
+    def order_ids(
+        history: VisitHistory, here: str, live: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        ctx = InvokeContext(here, "", "")
+        sessions = _open_sessions_by_ids(live)
+        ordered = history.order(ctx, sessions)
+        return tuple(s.ref.session_id for s in ordered)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "edge.json"
+        history = VisitHistory(path)
+        seed = _VisitEdge.make(SessionRef("B"), SessionRef("A"))
+        assert seed is not None
+        history._store(seed)
+
+        assert order_ids(history, "A", ("C", "B", "A")) == ("B", "C", "A")
+        live_bca = _open_sessions_by_ids(("B", "C", "A"))
+        ctx_a = InvokeContext("A", "", "")
+        assert history.order(ctx_a, live_bca) is live_bca
+        assert order_ids(history, "A", ("C", "A")) == ("C", "A")
+        assert order_ids(history, "C", ("C", "B", "A")) == ("C", "B", "A")
+        assert order_ids(history, "", ("C", "B", "A")) == ("C", "B", "A")
+
+        path.unlink()
+        assert order_ids(history, "A", ("C", "B", "A")) == ("C", "B", "A")
+
+        path.write_bytes(b"not json")
+        assert order_ids(history, "A", ("C", "B", "A")) == ("C", "B", "A")
+
+        path.write_text('{"v": 2, "departed": "B", "arrived": "A"}\n')
+        assert order_ids(history, "A", ("C", "B", "A")) == ("C", "B", "A")
+
+        path.write_text('{"v": 1, "departed": "A", "arrived": "A"}\n')
+        assert order_ids(history, "A", ("C", "B", "A")) == ("C", "B", "A")
+
+        path.unlink()
+        ctx_a = InvokeContext("A", "", "")
+        history.remember(ctx_a, SessionRef("B"))
+        assert json.loads(path.read_text()) == {
+            "v": 1,
+            "departed": "A",
+            "arrived": "B",
+        }
+        mtime = path.stat().st_mtime_ns
+        history.remember(ctx_a, SessionRef("B"))
+        assert path.stat().st_mtime_ns == mtime
+
+        path.unlink()
+        history.remember(ctx_a, SessionRef("A"))
+        assert not path.exists()
+
+        history.remember(ctx_a, SessionRef("B"))
+        assert order_ids(history, "B", ("C", "A", "B")) == ("A", "C", "B")
+
+        back_edge = _VisitEdge.make(SessionRef("B"), SessionRef("A"))
+        assert back_edge is not None
+        history._store(back_edge)
+
+        board = PickerBoard.build(
+            LiveSessions(_open_sessions_by_ids(("C", "B", "A"))),
+            [CanonicalPath(os.getcwd())],
+        )
+        ordered_board = replace(
+            board,
+            open_sessions=history.order(
+                InvokeContext("A", "", ""), board.open_sessions
+            ),
+        )
+        token = "wiretest"
+        listing = ordered_board._render_source(token, TtySize(80))
+        lines = [ln for ln in listing.splitlines() if ln.strip()]
+        assert lines[0].startswith(f"{token}{_WIRE_OPEN}0\t")
+        lifted = ordered_board._decision_from_stdout(token, lines[0])
+        assert lifted is not None
+        assert lifted.choice.ref.session_id == "B"
+        dir_line = next(ln for ln in lines if f"{token}{_WIRE_DIR}" in ln.split("\t", 1)[0])
+        assert dir_line.startswith(f"{token}{_WIRE_DIR}0\t")
+        dir_pick = ordered_board._decision_from_stdout(token, dir_line)
+        assert isinstance(dir_pick.choice, DirectoryLaunch)
+        assert dir_pick.choice == ordered_board.launches[0]
+        open_count = sum(1 for ln in lines if f"{token}{_WIRE_OPEN}" in ln.split("\t", 1)[0])
+        dir_idx = lines.index(dir_line)
+        assert dir_idx == open_count
+        argv = ordered_board._fzf_argv("fzf")
+        assert "--layout=reverse" in argv
+        assert "--no-sort" in argv
+
+    print("visit history self-check ok")
 
 
 _FZF_ELLIPSIS = "··"
@@ -616,6 +830,7 @@ def _check_layout() -> None:
     _layout_row_self_check()
     _open_display_self_check()
     _board_source_self_check()
+    _visit_history_self_check()
     fzf = find_bin("fzf")
     if not fzf:
         raise SystemExit("missing fzf for pty layout check")
