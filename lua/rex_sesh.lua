@@ -110,7 +110,6 @@ rex.action{
     if ctx.session_id == nil then
       error("run from a terminal pane (key or palette), not bare rex CLI", 0)
     end
-    -- Config actions are killed at ~30s; detached children die with them.
     return M.open(ctx)
   end,
 }
