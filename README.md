@@ -1,6 +1,6 @@
 # rex-navigator
 
-Keyboard-driven **new Rex session from zoxide history**. A shortcut opens a floating fzf picker over directories you have visited; Enter creates a session at that path and switches this Rex app client to it.
+Keyboard-driven Rex session picker from zoxide history. A shortcut opens a floating fzf list. Open sessions appear near the prompt as labels only; Enter switches to that session. Directory rows still create a session at that path and switch this Rex app client to it.
 
 ## Dependencies
 
@@ -39,7 +39,7 @@ rex config reload
 
 ## Usage
 
-Focus a terminal pane and press ⌘⇧J, or run **New Session from Zoxide…** from the command palette. Esc cancels without creating a session.
+Focus a terminal pane and press ⌘⇧J, or run **New Session from Zoxide…** from the command palette. Enter on an open session switches to it. Enter on a directory creates a session there. Esc cancels.
 
 You can also run the installed action from a session:
 
