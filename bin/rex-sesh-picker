@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
+import pty
+import select
 import shutil
+import struct
 import subprocess
 import sys
+import termios
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,7 +76,141 @@ class SessionLabel:
 class ZoxideCandidate:
     path: CanonicalPath
     label: SessionLabel
-    display: str
+
+
+@dataclass(frozen=True)
+class TtySize:
+    columns: int
+
+    @staticmethod
+    def _ioctl_columns(fd: int) -> int | None:
+        try:
+            buf = fcntl.ioctl(fd, termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+            _rows, cols, _xpix, _ypix = struct.unpack("HHHH", buf)
+            if cols >= 1:
+                return cols
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
+    def read() -> TtySize:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if stream.isatty():
+                    cols = TtySize._ioctl_columns(stream.fileno())
+                    if cols is not None:
+                        return TtySize(cols)
+            except (AttributeError, ValueError, OSError):
+                pass
+        try:
+            with open("/dev/tty", "rb", buffering=0) as tty:
+                cols = TtySize._ioctl_columns(tty.fileno())
+                if cols is not None:
+                    return TtySize(cols)
+        except OSError:
+            pass
+        size = shutil.get_terminal_size(fallback=(80, 24))
+        columns = size.columns if size.columns >= 1 else 80
+        return TtySize(columns)
+
+
+@dataclass(frozen=True)
+class ItemColumns:
+    value: int
+
+
+@dataclass(frozen=True)
+class _FzfFrame:
+    margin_y: int
+    margin_x: int
+    border_cols: int
+    scrollbar_cols: int
+    pointer_cols: int
+    gutter_cols: int
+    min_gap: int
+    prompt: str
+    header: str
+
+    def argv_tail(self) -> list[str]:
+        border = "rounded" if self.border_cols else "none"
+        return [
+            "--ansi",
+            f"--margin={self.margin_y},{self.margin_x}",
+            f"--border={border}",
+            "--delimiter=\t",
+            "--with-nth=2",
+            "--layout=reverse",
+            f"--prompt={self.prompt}",
+            f"--header={self.header}",
+        ]
+
+    def item_columns(self, tty: TtySize) -> ItemColumns:
+        chrome = (
+            2 * self.margin_x
+            + 2 * self.border_cols
+            + self.scrollbar_cols
+            + self.pointer_cols
+            + self.gutter_cols
+        )
+        usable = tty.columns - chrome
+        return ItemColumns(max(1, usable))
+
+
+_SESH_FZF_FRAME = _FzfFrame(
+    margin_y=1,
+    margin_x=2,
+    border_cols=1,
+    scrollbar_cols=1,
+    pointer_cols=1,
+    gutter_cols=2,
+    min_gap=2,
+    prompt="zoxide ❯ ",
+    header="enter: new session · esc: cancel",
+)
+
+_ELLIPSIS = "…"
+
+
+def _cols(text: str) -> int:
+    return len(text)
+
+
+def _sanitize(text: str) -> str:
+    return "".join(" " if ord(ch) < 32 else ch for ch in text)
+
+
+def _fit(text: str, budget: int, keep: str) -> tuple[str, int]:
+    width = _cols(text)
+    if width <= budget:
+        return text, width
+    if budget <= 0:
+        return "", 0
+    ell_w = _cols(_ELLIPSIS)
+    if budget <= ell_w:
+        return (_ELLIPSIS[:budget], budget)
+    piece = budget - ell_w
+    if keep == "head":
+        out = text[:piece] + _ELLIPSIS
+    else:
+        out = _ELLIPSIS + text[width - piece :]
+    return out, _cols(out)
+
+
+def _layout_row(label: str, path_pretty: str, pane: int, min_gap: int) -> str:
+    raw_label = _sanitize(label)
+    raw_path = _sanitize(path_pretty)
+    lw, pw = _cols(raw_label), _cols(raw_path)
+    if lw + min_gap + pw <= pane:
+        gap = pane - lw - pw
+        return raw_label + (" " * gap) + raw_path
+    leftover = pane - lw - min_gap
+    if leftover >= 1 and lw + min_gap <= pane:
+        path_text, path_w = _fit(raw_path, leftover, "tail")
+        gap = pane - lw - path_w
+        return raw_label + (" " * gap) + path_text
+    head, _ = _fit(raw_label, pane, "head")
+    return head
 
 
 @dataclass(frozen=True)
@@ -138,36 +277,28 @@ def build_zoxide_candidates(
     out: list[ZoxideCandidate] = []
     for p in paths:
         label = session_label_for(p, live_labels)
-        disp = f"{label.value}   {pretty(p.value)}"
-        out.append(ZoxideCandidate(path=p, label=label, display=disp))
+        out.append(ZoxideCandidate(path=p, label=label))
     return out
 
 
 def render_fzf_input(
-    cands: list[ZoxideCandidate], token: str
+    cands: list[ZoxideCandidate], token: str, tty: TtySize
 ) -> tuple[str, dict[str, ZoxideCandidate]]:
+    pane = _SESH_FZF_FRAME.item_columns(tty).value
+    min_gap = _SESH_FZF_FRAME.min_gap
     lookup: dict[str, ZoxideCandidate] = {}
     lines: list[str] = []
     for i, c in enumerate(cands):
         cid = f"{token}{i}"
         lookup[cid] = c
-        line = f"{cid}\t{c.display}"
+        display = _layout_row(c.label.value, pretty(c.path.value), pane, min_gap)
+        line = f"{cid}\t{display}"
         lines.append(line)
     return "\n".join(lines) + "\n", lookup
 
 
 def run_fzf(fzf: str, listing: str, lookup: dict[str, ZoxideCandidate]) -> ZoxideCandidate | None:
-    argv = [
-        fzf,
-        "--ansi",
-        "--delimiter=\t",
-        "--with-nth=2",
-        "--layout=reverse",
-        "--border=rounded",
-        "--margin=1,2",
-        "--prompt=zoxide ❯ ",
-        "--header=enter: new session · esc: cancel",
-    ]
+    argv = [fzf, *_SESH_FZF_FRAME.argv_tail()]
     proc = subprocess.run(
         argv, input=listing.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
@@ -175,6 +306,128 @@ def run_fzf(fzf: str, listing: str, lookup: dict[str, ZoxideCandidate]) -> Zoxid
         return None
     cid = proc.stdout.decode("utf-8", "replace").strip().split("\t", 1)[0].strip()
     return lookup.get(cid)
+
+
+def pick_candidate(fzf: str, cands: list[ZoxideCandidate]) -> ZoxideCandidate | None:
+    tty = TtySize.read()
+    token = hashlib.sha256(f"{time.time_ns()}".encode()).hexdigest()[:8]
+    listing, lookup = render_fzf_input(cands, token, tty)
+    return run_fzf(fzf, listing, lookup)
+
+
+def _layout_row_self_check() -> None:
+    frame = _SESH_FZF_FRAME
+
+    def assert_row(label: str, path_p: str, pane: int, expect_suffix: str | None, expect_len: int):
+        row = _layout_row(label, path_p, pane, frame.min_gap)
+        assert "\t" not in row and "\n" not in row, row
+        assert _cols(row) <= pane, (row, pane, _cols(row))
+        if expect_len is not None:
+            assert _cols(row) == expect_len, (row, expect_len)
+        if expect_suffix is not None:
+            assert row.endswith(expect_suffix), (row, expect_suffix)
+
+    pane = 40
+    path = "~/src/rex-navigator"
+    row = _layout_row("navigator", path, pane, frame.min_gap)
+    assert row.endswith(path)
+    assert _cols(row) == pane
+    assert row.index(path) > len("navigator")
+
+    long_path = "/" + "x" * 80
+    tail_room = pane - len("nav") - frame.min_gap
+    expect_tail = _ELLIPSIS + long_path[-(tail_room - 1) :]
+    assert_row("nav", long_path, pane, expect_tail, pane)
+
+    assert_row("x" * 50, "/short", pane, None, pane)
+
+    print("layout self-check ok")
+
+
+_FZF_ELLIPSIS = "··"
+
+
+def _pty_set_cols(fd: int, cols: int, rows: int = 24) -> None:
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def _fzf_pty_layout_check(fzf: str) -> None:
+    marker = "/ZZZ_REX_SESH_LAYOUT_MARKER"
+    tty = TtySize(80)
+    pane = _SESH_FZF_FRAME.item_columns(tty).value
+    row = _layout_row("nav", marker, pane, _SESH_FZF_FRAME.min_gap)
+    assert _cols(row) == pane, (row, pane, _cols(row))
+    assert row.endswith(marker), row
+    listing = f"t0\t{row}\n"
+    argv = [fzf, *_SESH_FZF_FRAME.argv_tail()]
+
+    master, slave = pty.openpty()
+    _pty_set_cols(master, 80)
+    _pty_set_cols(slave, 80)
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
+        )
+    finally:
+        os.close(slave)
+
+    captured = bytearray()
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(listing.encode("utf-8"))
+        proc.stdin.close()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 0.05)
+            if ready:
+                chunk = os.read(master, 65536)
+                if not chunk:
+                    break
+                captured.extend(chunk)
+            if marker.encode() in captured or _FZF_ELLIPSIS.encode() in captured:
+                break
+            if proc.poll() is not None:
+                break
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        os.close(master)
+
+    text = captured.decode("utf-8", "replace")
+    if _FZF_ELLIPSIS in text:
+        raise AssertionError(
+            f"fzf line truncation ({_FZF_ELLIPSIS!r}) in pty output at 80 cols"
+        )
+    if marker not in text:
+        raise AssertionError(
+            f"path marker missing from fzf pty output at 80 cols (pane={pane})"
+        )
+    print("fzf pty layout check ok")
+
+
+def _check_layout() -> None:
+    _layout_row_self_check()
+    fzf = find_bin("fzf")
+    if not fzf:
+        raise SystemExit("missing fzf for pty layout check")
+    _fzf_pty_layout_check(fzf)
+    chrome = (
+        2 * _SESH_FZF_FRAME.margin_x
+        + 2 * _SESH_FZF_FRAME.border_cols
+        + _SESH_FZF_FRAME.scrollbar_cols
+        + _SESH_FZF_FRAME.pointer_cols
+        + _SESH_FZF_FRAME.gutter_cols
+    )
+    assert chrome >= 10, chrome
+    assert _SESH_FZF_FRAME.item_columns(TtySize(80)).value == 70, chrome
 
 
 def create_session(rex: str, label: SessionLabel, path: CanonicalPath) -> SessionRef:
@@ -280,9 +533,7 @@ def main() -> None:
         fail("no zoxide directories yet", "Visit some folders so zoxide has history.")
 
     cands = build_zoxide_candidates(paths, live_labels)
-    token = hashlib.sha256(f"{time.time_ns()}".encode()).hexdigest()[:8]
-    listing, lookup = render_fzf_input(cands, token)
-    cand = run_fzf(fzf, listing, lookup)
+    cand = pick_candidate(fzf, cands)
     if cand is None:
         return
 
@@ -312,6 +563,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--check-layout":
+        _check_layout()
+        sys.exit(0)
     try:
         main()
     except SystemExit:
