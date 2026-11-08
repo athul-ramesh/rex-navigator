@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
+import pty
+import select
 import shutil
+import struct
 import subprocess
 import sys
+import termios
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,7 +83,33 @@ class TtySize:
     columns: int
 
     @staticmethod
+    def _ioctl_columns(fd: int) -> int | None:
+        try:
+            buf = fcntl.ioctl(fd, termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+            _rows, cols, _xpix, _ypix = struct.unpack("HHHH", buf)
+            if cols >= 1:
+                return cols
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
     def read() -> TtySize:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if stream.isatty():
+                    cols = TtySize._ioctl_columns(stream.fileno())
+                    if cols is not None:
+                        return TtySize(cols)
+            except (AttributeError, ValueError, OSError):
+                pass
+        try:
+            with open("/dev/tty", "rb", buffering=0) as tty:
+                cols = TtySize._ioctl_columns(tty.fileno())
+                if cols is not None:
+                    return TtySize(cols)
+        except OSError:
+            pass
         size = shutil.get_terminal_size(fallback=(80, 24))
         columns = size.columns if size.columns >= 1 else 80
         return TtySize(columns)
@@ -95,6 +126,8 @@ class _FzfFrame:
     margin_x: int
     border_cols: int
     scrollbar_cols: int
+    pointer_cols: int
+    gutter_cols: int
     min_gap: int
     prompt: str
     header: str
@@ -113,12 +146,14 @@ class _FzfFrame:
         ]
 
     def item_columns(self, tty: TtySize) -> ItemColumns:
-        usable = (
-            tty.columns
-            - 2 * self.margin_x
-            - 2 * self.border_cols
-            - self.scrollbar_cols
+        chrome = (
+            2 * self.margin_x
+            + 2 * self.border_cols
+            + self.scrollbar_cols
+            + self.pointer_cols
+            + self.gutter_cols
         )
+        usable = tty.columns - chrome
         return ItemColumns(max(1, usable))
 
 
@@ -127,6 +162,8 @@ _SESH_FZF_FRAME = _FzfFrame(
     margin_x=2,
     border_cols=1,
     scrollbar_cols=1,
+    pointer_cols=1,
+    gutter_cols=2,
     min_gap=2,
     prompt="zoxide ❯ ",
     header="enter: new session · esc: cancel",
@@ -307,6 +344,90 @@ def _layout_row_self_check() -> None:
     print("layout self-check ok")
 
 
+_FZF_ELLIPSIS = "··"
+
+
+def _pty_set_cols(fd: int, cols: int, rows: int = 24) -> None:
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def _fzf_pty_layout_check(fzf: str) -> None:
+    marker = "/ZZZ_REX_SESH_LAYOUT_MARKER"
+    tty = TtySize(80)
+    pane = _SESH_FZF_FRAME.item_columns(tty).value
+    row = _layout_row("nav", marker, pane, _SESH_FZF_FRAME.min_gap)
+    assert _cols(row) == pane, (row, pane, _cols(row))
+    assert row.endswith(marker), row
+    listing = f"t0\t{row}\n"
+    argv = [fzf, *_SESH_FZF_FRAME.argv_tail()]
+
+    master, slave = pty.openpty()
+    _pty_set_cols(master, 80)
+    _pty_set_cols(slave, 80)
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
+        )
+    finally:
+        os.close(slave)
+
+    captured = bytearray()
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(listing.encode("utf-8"))
+        proc.stdin.close()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 0.05)
+            if ready:
+                chunk = os.read(master, 65536)
+                if not chunk:
+                    break
+                captured.extend(chunk)
+            if marker.encode() in captured or _FZF_ELLIPSIS.encode() in captured:
+                break
+            if proc.poll() is not None:
+                break
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        os.close(master)
+
+    text = captured.decode("utf-8", "replace")
+    if _FZF_ELLIPSIS in text:
+        raise AssertionError(
+            f"fzf line truncation ({_FZF_ELLIPSIS!r}) in pty output at 80 cols"
+        )
+    if marker not in text:
+        raise AssertionError(
+            f"path marker missing from fzf pty output at 80 cols (pane={pane})"
+        )
+    print("fzf pty layout check ok")
+
+
+def _check_layout() -> None:
+    _layout_row_self_check()
+    fzf = find_bin("fzf")
+    if not fzf:
+        raise SystemExit("missing fzf for pty layout check")
+    _fzf_pty_layout_check(fzf)
+    chrome = (
+        2 * _SESH_FZF_FRAME.margin_x
+        + 2 * _SESH_FZF_FRAME.border_cols
+        + _SESH_FZF_FRAME.scrollbar_cols
+        + _SESH_FZF_FRAME.pointer_cols
+        + _SESH_FZF_FRAME.gutter_cols
+    )
+    assert chrome >= 10, chrome
+    assert _SESH_FZF_FRAME.item_columns(TtySize(80)).value == 70, chrome
 
 
 def create_session(rex: str, label: SessionLabel, path: CanonicalPath) -> SessionRef:
@@ -443,7 +564,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--check-layout":
-        _layout_row_self_check()
+        _check_layout()
         sys.exit(0)
     try:
         main()
