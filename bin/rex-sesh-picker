@@ -16,7 +16,7 @@ import termios
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import AbstractSet, NoReturn
 
 PATH_FALLBACKS = [
     "/opt/homebrew/bin",
@@ -73,12 +73,6 @@ class SessionLabel:
 
 
 @dataclass(frozen=True)
-class ZoxideCandidate:
-    path: CanonicalPath
-    label: SessionLabel
-
-
-@dataclass(frozen=True)
 class TtySize:
     columns: int
 
@@ -132,8 +126,9 @@ class _FzfFrame:
     prompt: str
     header: str
 
-    def argv_tail(self) -> list[str]:
+    def argv_tail(self, header: str | None = None) -> list[str]:
         border = "rounded" if self.border_cols else "none"
+        h = self.header if header is None else header
         return [
             "--ansi",
             f"--margin={self.margin_y},{self.margin_x}",
@@ -142,7 +137,7 @@ class _FzfFrame:
             "--with-nth=2",
             "--layout=reverse",
             f"--prompt={self.prompt}",
-            f"--header={self.header}",
+            f"--header={h}",
         ]
 
     def item_columns(self, tty: TtySize) -> ItemColumns:
@@ -230,10 +225,190 @@ class AppClientId:
     value: str
 
 
+class RexListError(Exception):
+    pass
+
+
+class ZoxideError(Exception):
+    pass
+
+
+class ActionError(Exception):
+    def __init__(self, message: str, advice: str = "") -> None:
+        super().__init__(message)
+        self.message = message
+        self.advice = advice
+
+
+@dataclass(frozen=True)
+class OpenSession:
+    ref: SessionRef
+    label: SessionLabel
+
+    def display(self, pane: int) -> str:
+        text, _ = _fit(_sanitize(self.label.value), pane, "head")
+        return text
+
+
+@dataclass(frozen=True)
+class DirectoryLaunch:
+    path: CanonicalPath
+    label: SessionLabel
+
+    def display(self, pane: int, min_gap: int) -> str:
+        return _layout_row(self.label.value, pretty(self.path.value), pane, min_gap)
+
+
+@dataclass(frozen=True)
+class Decision:
+    choice: OpenSession | DirectoryLaunch
+
+
+@dataclass(frozen=True)
+class LiveSessions:
+    sessions: tuple[OpenSession, ...]
+
+    @staticmethod
+    def load(rex: str) -> LiveSessions:
+        r = run([rex, "ls", "--json"])
+        if r.returncode != 0:
+            raise RexListError(
+                f"rex ls failed: {r.stderr.strip() or r.stdout.strip()}"
+            )
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            raise RexListError(f"rex ls returned invalid JSON: {e}") from e
+        if not isinstance(data, dict):
+            raise RexListError("rex ls returned unexpected payload")
+        raw_list = data.get("sessions") or []
+        if not isinstance(raw_list, list):
+            raise RexListError("rex ls sessions field is not a list")
+        out: list[OpenSession] = []
+        for item in raw_list:
+            if not isinstance(item, dict):
+                continue
+            sid = item.get("session_id")
+            label = item.get("label")
+            if not isinstance(sid, str) or not sid:
+                continue
+            if not isinstance(label, str) or not label:
+                continue
+            out.append(OpenSession(SessionRef(sid), SessionLabel(label)))
+        return LiveSessions(tuple(out))
+
+    def labels(self) -> frozenset[str]:
+        return frozenset(s.label.value for s in self.sessions)
+
+
+@dataclass(frozen=True)
+class PickerBoard:
+    open_sessions: tuple[OpenSession, ...]
+    launches: tuple[DirectoryLaunch, ...]
+
+    @staticmethod
+    def load(rex: str, zox: str) -> PickerBoard:
+        live = LiveSessions.load(rex)
+        paths = zoxide_dirs(zox)
+        return PickerBoard.build(live, paths)
+
+    @staticmethod
+    def build(live: LiveSessions, paths: list[CanonicalPath]) -> PickerBoard:
+        label_set = live.labels()
+        launches = tuple(
+            DirectoryLaunch(
+                path=p,
+                label=session_label_for(p, label_set),
+            )
+            for p in paths
+        )
+        return PickerBoard(open_sessions=live.sessions, launches=launches)
+
+    def is_empty(self) -> bool:
+        return not self.open_sessions and not self.launches
+
+    def choose(self, fzf: str, rex: str, ctx: InvokeContext) -> None:
+        decision = self._pick(fzf)
+        if decision is None:
+            return
+        apply_decision(rex, ctx, decision)
+
+    def _pick(self, fzf: str) -> Decision | None:
+        tty = TtySize.read()
+        token = hashlib.sha256(f"{time.time_ns()}".encode()).hexdigest()[:8]
+        listing = self._render_source(token, tty)
+        argv = self._fzf_argv(fzf, token)
+        proc = subprocess.run(
+            argv,
+            input=listing.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode in (1, 130) or not proc.stdout.strip():
+            return None
+        if proc.returncode != 0:
+            err = (proc.stderr + proc.stdout).decode("utf-8", "replace").strip()
+            raise ActionError(f"fzf failed: {err}")
+        raw = proc.stdout.decode("utf-8", "replace").strip()
+        return self._decision_from_stdout(token, raw)
+
+    def _render_source(self, token: str, tty: TtySize) -> str:
+        pane = _SESH_FZF_FRAME.item_columns(tty).value
+        min_gap = _SESH_FZF_FRAME.min_gap
+        lines: list[str] = []
+        for i, session in enumerate(self.open_sessions):
+            cid = f"{token}o{i}"
+            display = session.display(pane)
+            lines.append(f"{cid}\t{display}")
+        for i, launch in enumerate(self.launches):
+            cid = f"{token}d{i}"
+            display = launch.display(pane, min_gap)
+            lines.append(f"{cid}\t{display}")
+        return "\n".join(lines) + "\n"
+
+    def _decision_from_stdout(self, token: str, raw: str) -> Decision | None:
+        cid = raw.split("\t", 1)[0].strip()
+        if not cid.startswith(token) or len(cid) <= len(token):
+            return None
+        rest = cid[len(token) :]
+        if not rest:
+            return None
+        kind, idx_s = rest[0], rest[1:]
+        if not idx_s.isdigit():
+            return None
+        idx = int(idx_s)
+        if kind == "o":
+            if 0 <= idx < len(self.open_sessions):
+                return Decision(self.open_sessions[idx])
+            return None
+        if kind == "d":
+            if 0 <= idx < len(self.launches):
+                return Decision(self.launches[idx])
+            return None
+        return None
+
+    def _header(self) -> str:
+        has_open = bool(self.open_sessions)
+        has_dirs = bool(self.launches)
+        if has_open and has_dirs:
+            return (
+                "enter: switch open session or create from a directory · esc: cancel"
+            )
+        if has_open:
+            return "enter: switch session · esc: cancel"
+        return "enter: new session · esc: cancel"
+
+    def _fzf_argv(self, fzf_bin: str, token: str) -> list[str]:
+        argv = [fzf_bin, *_SESH_FZF_FRAME.argv_tail(self._header())]
+        if self.open_sessions and self.launches:
+            argv.append("--no-sort")
+        return argv
+
+
 def zoxide_dirs(zox: str) -> list[CanonicalPath]:
     r = run([zox, "query", "--list"])
     if r.returncode != 0:
-        raise RuntimeError(f"zoxide query failed: {r.stderr.strip()}")
+        raise ZoxideError(f"zoxide query failed: {r.stderr.strip()}")
     seen: set[str] = set()
     out: list[CanonicalPath] = []
     for line in r.stdout.splitlines():
@@ -248,15 +423,7 @@ def zoxide_dirs(zox: str) -> list[CanonicalPath]:
     return out
 
 
-def list_session_labels(rex: str) -> set[str]:
-    r = run([rex, "ls", "--json"])
-    if r.returncode != 0:
-        raise RuntimeError(f"rex ls failed: {r.stderr.strip() or r.stdout.strip()}")
-    sessions = json.loads(r.stdout).get("sessions") or []
-    return {s.get("label", "") for s in sessions if s.get("label")}
-
-
-def session_label_for(path: CanonicalPath, live_labels: set[str]) -> SessionLabel:
+def session_label_for(path: CanonicalPath, live_labels: AbstractSet[str]) -> SessionLabel:
     base = os.path.basename(path.value.rstrip("/")) or path.value
     if base in live_labels:
         digest = hashlib.sha256(path.value.encode()).hexdigest()[:6]
@@ -271,48 +438,36 @@ def pretty(path: str) -> str:
     return path
 
 
-def build_zoxide_candidates(
-    paths: list[CanonicalPath], live_labels: set[str]
-) -> list[ZoxideCandidate]:
-    out: list[ZoxideCandidate] = []
-    for p in paths:
-        label = session_label_for(p, live_labels)
-        out.append(ZoxideCandidate(path=p, label=label))
-    return out
+def apply_decision(rex: str, ctx: InvokeContext, decision: Decision) -> None:
+    choice = decision.choice
+    if isinstance(choice, OpenSession):
+        try:
+            client = resolve_app_client(rex, ctx.client_id)
+        except RuntimeError as e:
+            raise ActionError(
+                str(e),
+                "That session is still open. Pick it from the sidebar.",
+            ) from e
+        perform_session_select(rex, client, choice.ref, created=None)
+        return
 
-
-def render_fzf_input(
-    cands: list[ZoxideCandidate], token: str, tty: TtySize
-) -> tuple[str, dict[str, ZoxideCandidate]]:
-    pane = _SESH_FZF_FRAME.item_columns(tty).value
-    min_gap = _SESH_FZF_FRAME.min_gap
-    lookup: dict[str, ZoxideCandidate] = {}
-    lines: list[str] = []
-    for i, c in enumerate(cands):
-        cid = f"{token}{i}"
-        lookup[cid] = c
-        display = _layout_row(c.label.value, pretty(c.path.value), pane, min_gap)
-        line = f"{cid}\t{display}"
-        lines.append(line)
-    return "\n".join(lines) + "\n", lookup
-
-
-def run_fzf(fzf: str, listing: str, lookup: dict[str, ZoxideCandidate]) -> ZoxideCandidate | None:
-    argv = [fzf, *_SESH_FZF_FRAME.argv_tail()]
-    proc = subprocess.run(
-        argv, input=listing.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-    )
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return None
-    cid = proc.stdout.decode("utf-8", "replace").strip().split("\t", 1)[0].strip()
-    return lookup.get(cid)
-
-
-def pick_candidate(fzf: str, cands: list[ZoxideCandidate]) -> ZoxideCandidate | None:
-    tty = TtySize.read()
-    token = hashlib.sha256(f"{time.time_ns()}".encode()).hexdigest()[:8]
-    listing, lookup = render_fzf_input(cands, token, tty)
-    return run_fzf(fzf, listing, lookup)
+    assert isinstance(choice, DirectoryLaunch)
+    try:
+        path = CanonicalPath.from_user_path(choice.path.value)
+    except ValueError as e:
+        raise ActionError(str(e)) from e
+    try:
+        session = create_session(rex, choice.label, path)
+    except RuntimeError as e:
+        raise ActionError(f"creating session failed: {e}") from e
+    try:
+        client = resolve_app_client(rex, ctx.client_id)
+    except RuntimeError as e:
+        raise ActionError(
+            str(e),
+            f"The session {session.session_id} was created; open it from the sidebar.",
+        ) from e
+    perform_session_select(rex, client, session, created=session)
 
 
 def _layout_row_self_check() -> None:
@@ -344,6 +499,44 @@ def _layout_row_self_check() -> None:
     print("layout self-check ok")
 
 
+def _open_display_self_check() -> None:
+    pane = 40
+    session = OpenSession(SessionRef("sid"), SessionLabel("navigator"))
+    display = session.display(pane)
+    assert display == "navigator", display
+    assert "\t" not in display and "\n" not in display
+    assert _cols(display) <= pane
+    long = OpenSession(SessionRef("s2"), SessionLabel("x" * 80))
+    clipped = long.display(pane)
+    assert _cols(clipped) <= pane
+    assert clipped.endswith(_ELLIPSIS)
+    print("open display self-check ok")
+
+
+def _board_source_self_check() -> None:
+    live = LiveSessions(
+        (OpenSession(SessionRef("sid-open"), SessionLabel("navigator")),)
+    )
+    board = PickerBoard.build(live, [CanonicalPath(os.getcwd())])
+    token = "abcd1234"
+    listing = board._render_source(token, TtySize(80))
+    lines = [ln for ln in listing.splitlines() if ln.strip()]
+    assert len(lines) >= 2, lines
+    assert lines[0].split("\t", 1)[1] == "navigator"
+    opened = board._decision_from_stdout(token, lines[0])
+    assert isinstance(opened, Decision)
+    assert isinstance(opened.choice, OpenSession)
+    assert opened.choice.ref.session_id == "sid-open"
+    launched = board._decision_from_stdout(token, lines[1])
+    assert isinstance(launched, Decision)
+    assert isinstance(launched.choice, DirectoryLaunch)
+    assert board._decision_from_stdout(token, f"{token}o99\tjunk") is None
+    argv = board._fzf_argv("fzf", token)
+    assert "--layout=reverse" in argv
+    assert "--no-sort" in argv
+    print("board source self-check ok")
+
+
 _FZF_ELLIPSIS = "··"
 
 
@@ -359,7 +552,8 @@ def _fzf_pty_layout_check(fzf: str) -> None:
     assert _cols(row) == pane, (row, pane, _cols(row))
     assert row.endswith(marker), row
     listing = f"t0\t{row}\n"
-    argv = [fzf, *_SESH_FZF_FRAME.argv_tail()]
+    board = PickerBoard.build(LiveSessions(()), [])
+    argv = board._fzf_argv(fzf, "t0")
 
     master, slave = pty.openpty()
     _pty_set_cols(master, 80)
@@ -415,6 +609,8 @@ def _fzf_pty_layout_check(fzf: str) -> None:
 
 def _check_layout() -> None:
     _layout_row_self_check()
+    _open_display_self_check()
+    _board_source_self_check()
     fzf = find_bin("fzf")
     if not fzf:
         raise SystemExit("missing fzf for pty layout check")
@@ -470,7 +666,10 @@ def resolve_app_client(rex: str, wanted: str) -> AppClientId:
 
 
 def perform_session_select(
-    rex: str, client: AppClientId, session: SessionRef, created_id: str
+    rex: str,
+    client: AppClientId,
+    session: SessionRef,
+    created: SessionRef | None,
 ) -> None:
     payload = json.dumps(
         {
@@ -485,12 +684,30 @@ def perform_session_select(
         return
     err = (r.stderr + r.stdout).strip()
     if "Remote Control" in err:
-        advice = (
-            "Enable Remote Control in the Rex app: Settings → Rex Server. "
-            f"The session {created_id} was created; open it from the sidebar."
+        if created is not None:
+            advice = (
+                "Enable Remote Control in the Rex app: Settings → Rex Server. "
+                f"The session {created.session_id} was created; open it from the sidebar."
+            )
+        else:
+            advice = (
+                "Enable Remote Control in the Rex app: Settings → Rex Server. "
+                "That session is still open; pick it from the sidebar."
+            )
+        raise ActionError(f"Rex refused the switch: {err}", advice)
+    raise ActionError(f"switching the client failed: {err}")
+
+
+def require_tools() -> tuple[str, str, str]:
+    missing = [n for n in ("rex", "fzf", "zoxide") if find_bin(n) is None]
+    if missing:
+        fail(
+            f"missing required programs: {', '.join(missing)}",
+            "Install them (brew install fzf zoxide) and make sure `rex` is on PATH.",
         )
-        fail(f"Rex refused the switch: {err}", advice)
-    fail(f"switching the client failed: {err}")
+    rex, fzf, zox = (find_bin(n) for n in ("rex", "fzf", "zoxide"))
+    assert rex and fzf and zox
+    return rex, fzf, zox
 
 
 def parse_args(argv: list[str]) -> InvokeContext:
@@ -508,58 +725,28 @@ def parse_args(argv: list[str]) -> InvokeContext:
 
 def main() -> None:
     ctx = parse_args(sys.argv[1:])
-
-    missing = [n for n in ("rex", "fzf", "zoxide") if find_bin(n) is None]
-    if missing:
-        fail(
-            f"missing required programs: {', '.join(missing)}",
-            "Install them (brew install fzf zoxide) and make sure `rex` is on PATH.",
-        )
-
-    rex, fzf, zox = (find_bin(n) for n in ("rex", "fzf", "zoxide"))
-    assert rex and fzf and zox
+    rex, fzf, zox = require_tools()
 
     try:
-        live_labels = list_session_labels(rex)
-    except RuntimeError as e:
+        board = PickerBoard.load(rex, zox)
+    except RexListError as e:
         fail(str(e), "Is the Rex server running? Run `rex ls` in a terminal to check.")
-
-    try:
-        paths = zoxide_dirs(zox)
-    except RuntimeError as e:
-        fail(str(e))
-
-    if not paths:
-        fail("no zoxide directories yet", "Visit some folders so zoxide has history.")
-
-    cands = build_zoxide_candidates(paths, live_labels)
-    cand = pick_candidate(fzf, cands)
-    if cand is None:
         return
-
-    try:
-        path = CanonicalPath.from_user_path(cand.path.value)
-    except ValueError as e:
+    except ZoxideError as e:
         fail(str(e))
         return
 
-    label = session_label_for(path, live_labels)
-    try:
-        session = create_session(rex, label, path)
-    except RuntimeError as e:
-        fail(f"creating session failed: {e}")
-        return
-
-    try:
-        client = resolve_app_client(rex, ctx.client_id)
-    except RuntimeError as e:
+    if board.is_empty():
         fail(
-            str(e),
-            f"The session {session.session_id} was created; open it from the sidebar.",
+            "no open sessions and no zoxide directories",
+            "Visit some folders so zoxide has history, or start a Rex session.",
         )
         return
 
-    perform_session_select(rex, client, session, session.session_id)
+    try:
+        board.choose(fzf, rex, ctx)
+    except ActionError as e:
+        fail(e.message, e.advice)
 
 
 if __name__ == "__main__":
