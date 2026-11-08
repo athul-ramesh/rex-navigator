@@ -76,14 +76,12 @@ class ZoxideCandidate:
 @dataclass(frozen=True)
 class TtySize:
     columns: int
-    lines: int
 
     @staticmethod
     def read() -> TtySize:
         size = shutil.get_terminal_size(fallback=(80, 24))
         columns = size.columns if size.columns >= 1 else 80
-        lines = size.lines if size.lines >= 1 else 24
-        return TtySize(columns, lines)
+        return TtySize(columns)
 
 
 @dataclass(frozen=True)
