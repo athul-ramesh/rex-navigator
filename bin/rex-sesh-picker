@@ -151,7 +151,7 @@ def render_fzf_input(
     for i, c in enumerate(cands):
         cid = f"{token}{i}"
         lookup[cid] = c
-        line = f"{cid}\t{c.display}\t\x1b[2m{c.path.value}\x1b[0m"
+        line = f"{cid}\t{c.display}"
         lines.append(line)
     return "\n".join(lines) + "\n", lookup
 
@@ -161,7 +161,7 @@ def run_fzf(fzf: str, listing: str, lookup: dict[str, ZoxideCandidate]) -> Zoxid
         fzf,
         "--ansi",
         "--delimiter=\t",
-        "--with-nth=2,3",
+        "--with-nth=2",
         "--layout=reverse",
         "--border=rounded",
         "--margin=1,2",
