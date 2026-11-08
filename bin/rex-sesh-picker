@@ -161,10 +161,12 @@ _SESH_FZF_FRAME = _FzfFrame(
     gutter_cols=2,
     min_gap=2,
     prompt="zoxide ❯ ",
-    header="enter: new session · esc: cancel",
+    header="",
 )
 
 _ELLIPSIS = "…"
+_WIRE_OPEN = "o"
+_WIRE_DIR = "d"
 
 
 def _cols(text: str) -> int:
@@ -357,11 +359,11 @@ class PickerBoard:
         min_gap = _SESH_FZF_FRAME.min_gap
         lines: list[str] = []
         for i, session in enumerate(self.open_sessions):
-            cid = f"{token}o{i}"
+            cid = f"{token}{_WIRE_OPEN}{i}"
             display = session.display(pane)
             lines.append(f"{cid}\t{display}")
         for i, launch in enumerate(self.launches):
-            cid = f"{token}d{i}"
+            cid = f"{token}{_WIRE_DIR}{i}"
             display = launch.display(pane, min_gap)
             lines.append(f"{cid}\t{display}")
         return "\n".join(lines) + "\n"
@@ -377,11 +379,11 @@ class PickerBoard:
         if not idx_s.isdigit():
             return None
         idx = int(idx_s)
-        if kind == "o":
+        if kind == _WIRE_OPEN:
             if 0 <= idx < len(self.open_sessions):
                 return Decision(self.open_sessions[idx])
             return None
-        if kind == "d":
+        if kind == _WIRE_DIR:
             if 0 <= idx < len(self.launches):
                 return Decision(self.launches[idx])
             return None
@@ -451,23 +453,26 @@ def apply_decision(rex: str, ctx: InvokeContext, decision: Decision) -> None:
         perform_session_select(rex, client, choice.ref, created=None)
         return
 
-    assert isinstance(choice, DirectoryLaunch)
-    try:
-        path = CanonicalPath.from_user_path(choice.path.value)
-    except ValueError as e:
-        raise ActionError(str(e)) from e
-    try:
-        session = create_session(rex, choice.label, path)
-    except RuntimeError as e:
-        raise ActionError(f"creating session failed: {e}") from e
-    try:
-        client = resolve_app_client(rex, ctx.client_id)
-    except RuntimeError as e:
-        raise ActionError(
-            str(e),
-            f"The session {session.session_id} was created; open it from the sidebar.",
-        ) from e
-    perform_session_select(rex, client, session, created=session)
+    if isinstance(choice, DirectoryLaunch):
+        try:
+            path = CanonicalPath.from_user_path(choice.path.value)
+        except ValueError as e:
+            raise ActionError(str(e)) from e
+        try:
+            session = create_session(rex, choice.label, path)
+        except RuntimeError as e:
+            raise ActionError(f"creating session failed: {e}") from e
+        try:
+            client = resolve_app_client(rex, ctx.client_id)
+        except RuntimeError as e:
+            raise ActionError(
+                str(e),
+                f"The session {session.session_id} was created; open it from the sidebar.",
+            ) from e
+        perform_session_select(rex, client, session, created=session)
+        return
+
+    raise ActionError(f"unknown picker choice: {type(choice).__name__}")
 
 
 def _layout_row_self_check() -> None:
@@ -699,15 +704,20 @@ def perform_session_select(
 
 
 def require_tools() -> tuple[str, str, str]:
-    missing = [n for n in ("rex", "fzf", "zoxide") if find_bin(n) is None]
+    found: dict[str, str] = {}
+    missing: list[str] = []
+    for name in ("rex", "fzf", "zoxide"):
+        path = find_bin(name)
+        if path is None:
+            missing.append(name)
+        else:
+            found[name] = path
     if missing:
         fail(
             f"missing required programs: {', '.join(missing)}",
             "Install them (brew install fzf zoxide) and make sure `rex` is on PATH.",
         )
-    rex, fzf, zox = (find_bin(n) for n in ("rex", "fzf", "zoxide"))
-    assert rex and fzf and zox
-    return rex, fzf, zox
+    return found["rex"], found["fzf"], found["zoxide"]
 
 
 def parse_args(argv: list[str]) -> InvokeContext:
