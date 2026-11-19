@@ -14,6 +14,16 @@ end
 
 local home = (os and os.getenv and os.getenv("HOME")) or ""
 
+-- The Rex server process PATH is often just /usr/bin:/bin:/usr/sbin:/sbin.
+-- Homebrew tools such as zoxide live outside that list, so resolve them
+-- against common prefixes the same way the old helper did.
+local PATH_FALLBACK_PREFIXES = {
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+}
+
 local function trim(s)
   return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
@@ -33,6 +43,39 @@ end
 
 local function basename(path)
   return (path:gsub("/+$", ""):match("([^/]+)$")) or path
+end
+
+local function path_executable(p)
+  local f = io and io.open and io.open(p, "rb")
+  if f then
+    f:close()
+    return p
+  end
+  return nil
+end
+
+local function find_bin(name)
+  local seen = {}
+  local function try(prefix)
+    if seen[prefix] then
+      return nil
+    end
+    seen[prefix] = true
+    return path_executable(prefix .. "/" .. name)
+  end
+  for prefix in string.gmatch(os.getenv("PATH") or "", "[^:]+") do
+    local hit = try(prefix)
+    if hit then
+      return hit
+    end
+  end
+  for _, prefix in ipairs(PATH_FALLBACK_PREFIXES) do
+    local hit = try(prefix)
+    if hit then
+      return hit
+    end
+  end
+  return nil
 end
 
 local function shell_quote(s)
@@ -230,9 +273,16 @@ local function load_open_sessions()
 end
 
 local function load_zoxide_launches(live_labels)
-  local r = rex.exec({ "zoxide", "query", "--list" })
+  local zoxide = find_bin("zoxide")
+  if zoxide == nil then
+    error(
+      "zoxide not found (checked PATH and Homebrew fallbacks; brew install zoxide)",
+      0
+    )
+  end
+  local r = rex.exec({ zoxide, "query", "--list" })
   if r == nil then
-    error("zoxide query failed: could not run zoxide", 0)
+    error("zoxide query failed: could not run " .. zoxide, 0)
   end
   if not r.ok then
     error("zoxide query failed: " .. trim(r.stderr), 0)
@@ -421,11 +471,16 @@ function M.self_check()
   local with_dup = M.session_label_for("/x/alpha", { alpha = true })
   assert(with_dup:match("^alpha%-%x%x%x%x%x%x$"))
 
+  local zoxide = find_bin("zoxide")
+  assert(zoxide ~= nil, "zoxide missing from PATH and Homebrew fallbacks")
+  assert(zoxide:sub(1, 1) == "/", zoxide)
+
   return "self_check ok"
 end
 
 M._internal = {
   pretty = pretty,
+  find_bin = find_bin,
   build_board = M.build_board,
   board_to_pick_items = M.board_to_pick_items,
   decision_from_id = M.decision_from_id,
