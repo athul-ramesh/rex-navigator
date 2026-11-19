@@ -1,8 +1,3 @@
--- rex_sesh: switch open Rex sessions or create one from a zoxide directory.
---
--- Install: symlink this file into ~/.config/rex and require("rex_sesh") from
--- init.lua, then bind a key or use the command palette.
-
 local M = {}
 
 local has_ui, ui = pcall(function()
@@ -14,9 +9,7 @@ end
 
 local home = (os and os.getenv and os.getenv("HOME")) or ""
 
--- The Rex server process PATH is often just /usr/bin:/bin:/usr/sbin:/sbin.
--- Homebrew tools such as zoxide live outside that list, so resolve them
--- against common prefixes the same way the old helper did.
+-- Rex server PATH is often /usr/bin:/bin:/usr/sbin:/sbin only.
 local PATH_FALLBACK_PREFIXES = {
   "/opt/homebrew/bin",
   "/usr/local/bin",
