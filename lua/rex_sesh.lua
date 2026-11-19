@@ -91,24 +91,44 @@ local function sha256_hex6(text)
   return hex:sub(1, 6)
 end
 
-local function is_dir(path)
-  local r = rex.exec({ "test", "-d", path })
-  return r ~= nil and r.ok
-end
+local RESOLVE_DIRS_PY = [[
+import os, sys
+seen = set()
+for line in sys.stdin:
+    raw = line.strip()
+    if not raw or not os.path.isdir(raw):
+        continue
+    try:
+        canon = os.path.realpath(raw)
+    except OSError:
+        continue
+    if not os.path.isdir(canon):
+        continue
+    canon = canon.replace("\\", "/")
+    if canon in seen:
+        continue
+    seen.add(canon)
+    print(canon)
+]]
 
-local function realpath_dir(raw)
-  if not is_dir(raw) then
-    return nil
+local function resolve_zoxide_dirs(raw_lines)
+  if #raw_lines == 0 then
+    return {}
   end
-  local r = rex.exec({ "realpath", raw })
+  local stdin = table.concat(raw_lines, "\n") .. "\n"
+  local r = rex.exec({ "python3", "-c", RESOLVE_DIRS_PY }, { stdin = stdin })
   if r == nil or not r.ok then
-    return nil
+    local err = (r and trim(r.stderr)) or "python resolve failed"
+    error("zoxide path resolve failed: " .. err, 0)
   end
-  local canon = trim(r.stdout)
-  if canon == "" or not is_dir(canon) then
-    return nil
+  local out = {}
+  for line in r.stdout:gmatch("[^\r\n]+") do
+    local canon = trim(line)
+    if canon ~= "" then
+      out[#out + 1] = slashes(canon)
+    end
   end
-  return slashes(canon)
+  return out
 end
 
 local VISIT_PATH = slashes(home) .. "/.config/rex/rex-sesh-visit-edge.json"
@@ -280,20 +300,19 @@ local function load_zoxide_launches(live_labels)
   if not r.ok then
     error("zoxide query failed: " .. trim(r.stderr), 0)
   end
-  local seen = {}
-  local launches = {}
+  local raw_lines = {}
   for line in r.stdout:gmatch("[^\r\n]+") do
     local raw = trim(line)
     if raw ~= "" then
-      local canon = realpath_dir(raw)
-      if canon ~= nil and not seen[canon] then
-        seen[canon] = true
-        launches[#launches + 1] = {
-          path = canon,
-          label = M.session_label_for(canon, live_labels),
-        }
-      end
+      raw_lines[#raw_lines + 1] = raw
     end
+  end
+  local launches = {}
+  for _, canon in ipairs(resolve_zoxide_dirs(raw_lines)) do
+    launches[#launches + 1] = {
+      path = canon,
+      label = M.session_label_for(canon, live_labels),
+    }
   end
   return launches
 end
@@ -315,6 +334,7 @@ function M.board_to_pick_items(board)
     items[#items + 1] = {
       id = OPEN_PREFIX .. session.session_id,
       title = session.label,
+      detail = "open",
       icon = "terminal",
     }
   end
@@ -445,7 +465,11 @@ function M.self_check()
   }
   local items = M.board_to_pick_items(board)
   assert(#items == 2)
-  assert(items[1].id == "o:sid-open" and items[1].icon == "terminal")
+  assert(
+    items[1].id == "o:sid-open"
+      and items[1].icon == "terminal"
+      and items[1].detail == "open"
+  )
   assert(items[2].id == "d:/tmp/ws" and items[2].subtitle == "/tmp/ws")
 
   local dec = M.decision_from_id("o:sid-open", board)
