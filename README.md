@@ -34,7 +34,7 @@ Focus a terminal pane and press ⌘⇧J, or run **New Session from Zoxide…** f
 
 Visit history keeps one back-edge (`~/.config/rex/rex-sesh-visit-edge.json`). When you open the picker from a session you arrived at via a switch, the prior session is listed first.
 
-You can skip the picker when testing:
+You can skip the picker when testing. `choice` must be an id from the current board (`o:` plus a live `session_id`, or `d:` plus a realpath that zoxide listed):
 
 ```bash
 rex do -s "$REX_SESSION" rex_sesh --args '{"choice":"o:SESSION_ID"}'
