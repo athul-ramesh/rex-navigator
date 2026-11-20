@@ -6,6 +6,7 @@ Keyboard-driven Rex session picker from zoxide history. A shortcut or the comman
 
 - [Rex](https://rex.dev) server running (custom UI needs control API revision 17+)
 - `zoxide` with some history (`brew install zoxide`)
+- `python3` on `PATH` or under `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, or `/bin` (same lookup as `zoxide`)
 - `realpath` and `shasum` (standard on macOS)
 
 ## Install

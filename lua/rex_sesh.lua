@@ -1,13 +1,10 @@
 local M = {}
 
-local has_ui, ui = pcall(function()
-  return rex.ui
-end)
-if not has_ui or ui == nil then
-  return M
-end
-
 local home = (os and os.getenv and os.getenv("HOME")) or ""
+
+local MAX_LAUNCHES = 48
+local CURRENT_DETAIL = "current"
+local OPEN_DETAIL = "open"
 
 -- Rex server PATH is often /usr/bin:/bin:/usr/sbin:/sbin only.
 local PATH_FALLBACK_PREFIXES = {
@@ -91,44 +88,167 @@ local function sha256_hex6(text)
   return hex:sub(1, 6)
 end
 
+local function split_lines(text)
+  if text == "" then
+    return {}
+  end
+  local out = {}
+  local pos = 1
+  while true do
+    local nl = text:find("\n", pos, true)
+    if nl then
+      out[#out + 1] = text:sub(pos, nl - 1)
+      pos = nl + 1
+    else
+      if pos <= #text then
+        out[#out + 1] = text:sub(pos)
+      end
+      break
+    end
+  end
+  return out
+end
+
+local function parse_zoxide_score_line(line)
+  local score_s, rest = line:match("^%s*([%d%.]+)%s+(.*)$")
+  if score_s == nil then
+    return nil
+  end
+  local score = tonumber(score_s)
+  local path = trim(rest or "")
+  if score == nil or path == "" then
+    return nil
+  end
+  return score, path
+end
+
+local function merge_resolved_scores(scores, canon_lines)
+  local by_path = {}
+  local order = {}
+  for i, canon in ipairs(canon_lines) do
+    if canon ~= "" then
+      local sc = scores[i]
+      if sc ~= nil then
+        local prev = by_path[canon]
+        if prev == nil then
+          by_path[canon] = sc
+          order[#order + 1] = canon
+        elseif sc > prev then
+          by_path[canon] = sc
+        end
+      end
+    end
+  end
+  local out = {}
+  for _, path in ipairs(order) do
+    out[#out + 1] = { path = path, score = by_path[path] }
+  end
+  return out
+end
+
+local function select_launches(scored, open_sessions, max_n)
+  local label_set = {}
+  local hex_labels = {}
+  local hex_bases = {}
+  for _, s in ipairs(open_sessions) do
+    if type(s.label) == "string" and s.label ~= "" then
+      label_set[s.label] = true
+      local base = s.label:match("^(.*)%-%x%x%x%x%x%x$")
+      if base ~= nil then
+        hex_labels[s.label] = true
+        hex_bases[base] = true
+      end
+    end
+  end
+
+  local basename_counts = {}
+  for _, row in ipairs(scored) do
+    local b = basename(row.path)
+    basename_counts[b] = (basename_counts[b] or 0) + 1
+  end
+
+  local function covered(path)
+    local b = basename(path)
+    if label_set[b] and basename_counts[b] == 1 then
+      return true
+    end
+    if hex_bases[b] then
+      return hex_labels[b .. "-" .. sha256_hex6(path)] == true
+    end
+    return false
+  end
+
+  local kept = {}
+  for _, row in ipairs(scored) do
+    if not covered(row.path) then
+      kept[#kept + 1] = row
+    end
+  end
+
+  for i, row in ipairs(kept) do
+    row._ord = i
+  end
+  table.sort(kept, function(a, b)
+    if a.score ~= b.score then
+      return a.score > b.score
+    end
+    return a._ord < b._ord
+  end)
+
+  local out = {}
+  for i = 1, math.min(max_n, #kept) do
+    out[#out + 1] = { path = kept[i].path, score = kept[i].score }
+  end
+  return out
+end
+
 local RESOLVE_DIRS_PY = [[
 import os, sys
-seen = set()
 for line in sys.stdin:
     raw = line.strip()
     if not raw or not os.path.isdir(raw):
+        print()
         continue
     try:
         canon = os.path.realpath(raw)
     except OSError:
+        print()
         continue
     if not os.path.isdir(canon):
+        print()
         continue
-    canon = canon.replace("\\", "/")
-    if canon in seen:
-        continue
-    seen.add(canon)
-    print(canon)
+    print(canon.replace("\\", "/"))
 ]]
 
 local function resolve_zoxide_dirs(raw_lines)
   if #raw_lines == 0 then
     return {}
   end
+  local python3 = find_bin("python3")
+  if python3 == nil then
+    error(
+      "python3 not found (checked PATH and Homebrew fallbacks; install python3)",
+      0
+    )
+  end
   local stdin = table.concat(raw_lines, "\n") .. "\n"
-  local r = rex.exec({ "python3", "-c", RESOLVE_DIRS_PY }, { stdin = stdin })
+  local r = rex.exec({ python3, "-c", RESOLVE_DIRS_PY }, { stdin = stdin })
   if r == nil or not r.ok then
     local err = (r and trim(r.stderr)) or "python resolve failed"
     error("zoxide path resolve failed: " .. err, 0)
   end
-  local out = {}
-  for line in r.stdout:gmatch("[^\r\n]+") do
-    local canon = trim(line)
+  local canon_lines = split_lines(r.stdout or "")
+  if #canon_lines ~= #raw_lines then
+    error("python3 resolve line count mismatch", 0)
+  end
+  for i, canon in ipairs(canon_lines) do
     if canon ~= "" then
-      out[#out + 1] = slashes(canon)
+      canon_lines[i] = slashes(trim(canon))
+    else
+      canon_lines[i] = ""
     end
   end
-  return out
+  return canon_lines
 end
 
 local VISIT_PATH = slashes(home) .. "/.config/rex/rex-sesh-visit-edge.json"
@@ -285,7 +405,7 @@ local function load_open_sessions()
   return out
 end
 
-local function load_zoxide_launches(live_labels)
+local function load_zoxide_launches(open_sessions)
   local zoxide = find_bin("zoxide")
   if zoxide == nil then
     error(
@@ -293,7 +413,7 @@ local function load_zoxide_launches(live_labels)
       0
     )
   end
-  local r = rex.exec({ zoxide, "query", "--list" })
+  local r = rex.exec({ zoxide, "query", "-l", "-s" })
   if r == nil then
     error("zoxide query failed: could not run " .. zoxide, 0)
   end
@@ -301,17 +421,24 @@ local function load_zoxide_launches(live_labels)
     error("zoxide query failed: " .. trim(r.stderr), 0)
   end
   local raw_lines = {}
+  local scores = {}
   for line in r.stdout:gmatch("[^\r\n]+") do
-    local raw = trim(line)
-    if raw ~= "" then
-      raw_lines[#raw_lines + 1] = raw
+    local score, path = parse_zoxide_score_line(line)
+    if score ~= nil and path ~= nil then
+      raw_lines[#raw_lines + 1] = path
+      scores[#scores + 1] = score
     end
   end
+  local canon_lines = resolve_zoxide_dirs(raw_lines)
+  local merged = merge_resolved_scores(scores, canon_lines)
+  local selected = select_launches(merged, open_sessions, MAX_LAUNCHES)
+  local live_labels = live_label_set(open_sessions)
   local launches = {}
-  for _, canon in ipairs(resolve_zoxide_dirs(raw_lines)) do
+  for _, row in ipairs(selected) do
     launches[#launches + 1] = {
-      path = canon,
-      label = M.session_label_for(canon, live_labels),
+      path = row.path,
+      label = M.session_label_for(row.path, live_labels),
+      score = row.score,
     }
   end
   return launches
@@ -319,9 +446,11 @@ end
 
 function M.build_board(here_session_id)
   local open_sessions = load_open_sessions()
-  local live_labels = live_label_set(open_sessions)
-  local launches = load_zoxide_launches(live_labels)
   open_sessions = order_open_sessions(open_sessions, here_session_id)
+  for _, s in ipairs(open_sessions) do
+    s.current = (here_session_id ~= nil and here_session_id ~= "" and s.session_id == here_session_id)
+  end
+  local launches = load_zoxide_launches(open_sessions)
   return { open_sessions = open_sessions, launches = launches }
 end
 
@@ -331,10 +460,14 @@ local DIR_PREFIX = "d:"
 function M.board_to_pick_items(board)
   local items = {}
   for _, session in ipairs(board.open_sessions) do
+    local detail = OPEN_DETAIL
+    if session.current then
+      detail = CURRENT_DETAIL
+    end
     items[#items + 1] = {
       id = OPEN_PREFIX .. session.session_id,
       title = session.label,
-      detail = "open",
+      detail = detail,
       icon = "terminal",
     }
   end
@@ -405,6 +538,25 @@ local function board_empty(board)
   return #board.open_sessions == 0 and #board.launches == 0
 end
 
+local function pick_request(board)
+  if board_empty(board) then
+    return {
+      title = "No sessions to show",
+      placeholder = "Visit folders so zoxide has history, or start a Rex session",
+      items = {},
+    }
+  end
+  return {
+    title = "Sessions",
+    placeholder = "Filter sessions and directories",
+    items = M.board_to_pick_items(board),
+  }
+end
+
+local function ui_pick_available(ui)
+  return type(ui) == "table" and type(ui.pick) == "function"
+end
+
 local function stop_pick(why)
   if why ~= "cancelled" then
     rex.log("warn", "rex_sesh: " .. tostring(why))
@@ -417,22 +569,20 @@ local function run(ctx, args)
   end
   args = args or {}
   local board = M.build_board(ctx.session_id)
-  if board_empty(board) then
-    rex.log(
-      "warn",
-      "rex_sesh: no open sessions and no zoxide directories "
-        .. "(visit folders so zoxide has history, or start a Rex session)"
-    )
-    return nil
-  end
 
   local choice = args.choice
   if choice == nil then
-    local id, why = rex.ui.pick({
-      title = "Sessions",
-      placeholder = "Filter sessions and directories",
-      items = M.board_to_pick_items(board),
-    })
+    local has_ui, ui = pcall(function()
+      return rex.ui
+    end)
+    if not has_ui or not ui_pick_available(ui) then
+      error(
+        "rex.ui.pick is missing (custom UI needs control API revision 17+)",
+        0
+      )
+    end
+    local req = pick_request(board)
+    local id, why = ui.pick(req)
     if id == nil then
       stop_pick(why)
       return nil
@@ -455,6 +605,65 @@ function M.self_check()
   assert(M.session_label_for("/tmp/foo", {}) == "foo")
   assert(pretty(home .. "/src") == "~/src")
 
+  assert(split_lines("a\n\nb\n")[1] == "a")
+  assert(split_lines("a\n\nb\n")[2] == "")
+  assert(split_lines("a\n\nb\n")[3] == "b")
+  assert(#split_lines("") == 0)
+
+  local sc, p = parse_zoxide_score_line("  88.5 /Users/a/b c")
+  assert(sc == 88.5 and p == "/Users/a/b c")
+  assert(parse_zoxide_score_line("nope") == nil)
+
+  local merged_one = merge_resolved_scores({ 1, 5, 3 }, { "/p", "/p", "" })
+  assert(#merged_one == 1 and merged_one[1].path == "/p" and merged_one[1].score == 5)
+
+  local uniq = select_launches(
+    { { path = "/tmp/ws", score = 10 }, { path = "/tmp/other", score = 5 } },
+  { { label = "ws" } },
+    MAX_LAUNCHES
+  )
+  assert(#uniq == 1 and uniq[1].path == "/tmp/other")
+
+  local shared = select_launches(
+    { { path = "/a/foo", score = 2 }, { path = "/b/foo", score = 1 } },
+    { { label = "foo" } },
+    MAX_LAUNCHES
+  )
+  assert(#shared == 2)
+
+  local hex_label = M.session_label_for("/b/foo", { foo = true })
+  local hex_hide = select_launches(
+    { { path = "/a/foo", score = 2 }, { path = "/b/foo", score = 1 } },
+    { { label = hex_label } },
+    MAX_LAUNCHES
+  )
+  assert(#hex_hide == 1 and hex_hide[1].path == "/a/foo")
+
+  local cap_hide = select_launches(
+    {
+      { path = "/covered", score = 30 },
+      { path = "/keep", score = 20 },
+      { path = "/drop", score = 10 },
+    },
+    { { label = "covered" } },
+    1
+  )
+  assert(#cap_hide == 1 and cap_hide[1].path == "/keep")
+
+  local tie = select_launches(
+    { { path = "/first", score = 5 }, { path = "/second", score = 5 } },
+    {},
+    2
+  )
+  assert(tie[1].path == "/first" and tie[2].path == "/second")
+
+  local sort10 = select_launches(
+    { { path = "/nine", score = 9 }, { path = "/ten", score = 10 } },
+    {},
+    MAX_LAUNCHES
+  )
+  assert(sort10[1].path == "/ten")
+
   local board = {
     open_sessions = {
       { session_id = "sid-open", label = "navigator" },
@@ -468,15 +677,32 @@ function M.self_check()
   assert(
     items[1].id == "o:sid-open"
       and items[1].icon == "terminal"
-      and items[1].detail == "open"
+      and items[1].detail == OPEN_DETAIL
   )
   assert(items[2].id == "d:/tmp/ws" and items[2].subtitle == "/tmp/ws")
+
+  local current_board = {
+    open_sessions = {
+      { session_id = "A", label = "a", current = false },
+      { session_id = "B", label = "b", current = true },
+    },
+    launches = {},
+  }
+  local cur_items = M.board_to_pick_items(current_board)
+  assert(cur_items[1].detail == OPEN_DETAIL and cur_items[2].detail == CURRENT_DETAIL)
 
   local dec = M.decision_from_id("o:sid-open", board)
   assert(dec and dec.kind == "open" and dec.session_id == "sid-open")
   dec = M.decision_from_id("d:/tmp/ws", board)
   assert(dec and dec.kind == "dir" and dec.path == "/tmp/ws")
   assert(M.decision_from_id("d:/nope", board) == nil)
+
+  local board2 = {
+    open_sessions = board.open_sessions,
+    launches = { { path = "/tmp/other", label = "other" } },
+  }
+  assert(M.decision_from_id("d:/tmp/ws", board2) == nil)
+  assert(M.decision_from_id("d:/tmp/other", board2).path == "/tmp/other")
 
   local ordered = lift_back_target({
     { session_id = "C", label = "c" },
@@ -485,6 +711,23 @@ function M.self_check()
   }, "B")
   assert(ordered[1].session_id == "B" and ordered[2].session_id == "C")
 
+  local with_current = {
+    { session_id = "C", label = "c", current = false },
+    { session_id = "B", label = "b", current = true },
+    { session_id = "A", label = "a", current = false },
+  }
+  local lifted = lift_back_target(with_current, "B")
+  assert(lifted[1].session_id == "B" and lifted[2].session_id == "C" and lifted[1].current == true)
+
+  local empty_req = pick_request({ open_sessions = {}, launches = {} })
+  assert(empty_req.title == "No sessions to show" and #empty_req.items == 0)
+  local full_req = pick_request(board)
+  assert(full_req.title == "Sessions" and #full_req.items == 2)
+
+  assert(ui_pick_available(nil) == false)
+  assert(ui_pick_available({}) == false)
+  assert(ui_pick_available({ pick = function() end }) == true)
+
   local with_dup = M.session_label_for("/x/alpha", { alpha = true })
   assert(with_dup:match("^alpha%-%x%x%x%x%x%x$"))
 
@@ -492,12 +735,25 @@ function M.self_check()
   assert(zoxide ~= nil, "zoxide missing from PATH and Homebrew fallbacks")
   assert(zoxide:sub(1, 1) == "/", zoxide)
 
+  local python3 = find_bin("python3")
+  assert(python3 ~= nil, "python3 missing from PATH and Homebrew fallbacks")
+  assert(python3:sub(1, 1) == "/", python3)
+
   return "self_check ok"
 end
 
 M._internal = {
   pretty = pretty,
   find_bin = find_bin,
+  split_lines = split_lines,
+  parse_zoxide_score_line = parse_zoxide_score_line,
+  merge_resolved_scores = merge_resolved_scores,
+  select_launches = select_launches,
+  pick_request = pick_request,
+  ui_pick_available = ui_pick_available,
+  MAX_LAUNCHES = MAX_LAUNCHES,
+  CURRENT_DETAIL = CURRENT_DETAIL,
+  OPEN_DETAIL = OPEN_DETAIL,
   build_board = M.build_board,
   board_to_pick_items = M.board_to_pick_items,
   decision_from_id = M.decision_from_id,
